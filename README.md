@@ -24,6 +24,12 @@
 (command -v curl >/dev/null 2>&1 && curl -fsSL https://raw.githubusercontent.com/xcdd/auto_docker_macvlan/main/auto_macvlan_manager.sh -o auto_macvlan_manager.sh || wget -qO auto_macvlan_manager.sh https://raw.githubusercontent.com/xcdd/auto_docker_macvlan/main/auto_macvlan_manager.sh) && chmod +x auto_macvlan_manager.sh && sudo ./auto_macvlan_manager.sh
 ```
 
+后续使用：
+
+```
+sudo ./auto_macvlan_manager.sh
+```
+
 安装后在系统中生成：
 
 - `/usr/local/bin/auto_macvlan.sh`：具体的自动配置脚本。

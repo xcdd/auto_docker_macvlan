@@ -16,6 +16,153 @@ SERVICE_SCRIPT="/usr/local/bin/auto_macvlan.sh"
 SERVICE_UNIT="/etc/systemd/system/auto_macvlan.service"
 SERVICE_NAME="auto_macvlan"
 
+# 自动安装依赖：根据系统包管理器安装缺失的命令
+function detect_pkg_manager() {
+  if command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"; return; fi
+  if command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"; return; fi
+  if command -v yum >/dev/null 2>&1; then PKG_MGR="yum"; return; fi
+  if command -v zypper >/dev/null 2>&1; then PKG_MGR="zypper"; return; fi
+  if command -v pacman >/dev/null 2>&1; then PKG_MGR="pacman"; return; fi
+  if command -v apk >/dev/null 2>&1; then PKG_MGR="apk"; return; fi
+  PKG_MGR=""
+}
+
+function pkg_install() {
+  local packages=("$@")
+  case "$PKG_MGR" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -y && apt-get install -y "${packages[@]}"
+      ;;
+    dnf)
+      dnf install -y "${packages[@]}"
+      ;;
+    yum)
+      yum install -y "${packages[@]}"
+      ;;
+    zypper)
+      zypper --non-interactive install -y "${packages[@]}"
+      ;;
+    pacman)
+      pacman -Sy --noconfirm "${packages[@]}"
+      ;;
+    apk)
+      apk add --no-cache "${packages[@]}"
+      ;;
+    *)
+      echo "错误：无法识别包管理器，无法自动安装：${packages[*]}"
+      return 1
+      ;;
+  esac
+}
+
+function ensure_downloader() {
+  if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then return; fi
+  detect_pkg_manager
+  echo "未检测到 curl/wget，尝试自动安装..."
+  pkg_install curl || pkg_install wget || echo "警告：无法安装 curl/wget，这是一个符合使用要求的Linux系统吗"
+}
+
+function ensure_ip() {
+  if command -v ip >/dev/null 2>&1; then return; fi
+  detect_pkg_manager
+  echo "未检测到 ip 命令，尝试自动安装..."
+  case "$PKG_MGR" in
+    apt|zypper|pacman|apk) pkg_install iproute2 ;;
+    dnf|yum) pkg_install iproute ;;
+    *) echo "错误：无法为当前系统安装 ip 命令"; exit 1 ;;
+  esac
+}
+
+function ensure_ipcalc() {
+  if command -v ipcalc >/dev/null 2>&1; then return; fi
+  detect_pkg_manager
+  echo "未检测到 ipcalc，尝试自动安装..."
+  case "$PKG_MGR" in
+    apt|zypper|pacman|apk) pkg_install ipcalc ;;
+    dnf) pkg_install ipcalc || pkg_install ipcalc-ng ;;
+    yum) pkg_install ipcalc ;;
+    *) echo "警告：无法安装 ipcalc，脚本将使用备用计算方法"; return ;;
+  esac
+}
+
+function ensure_systemctl() {
+  if command -v systemctl >/dev/null 2>&1; then return; fi
+  detect_pkg_manager
+  echo "未检测到 systemctl，尝试自动安装 systemd..."
+  case "$PKG_MGR" in
+    apt|dnf|yum|zypper|pacman) pkg_install systemd ;;
+    apk) echo "错误：检测到 Alpine/非 systemd 环境，无法安装 systemd；此脚本需要使用 systemd管理的linux系统"; exit 1 ;;
+    *) echo "错误：无法识别包管理器，无法安装 systemd"; exit 1 ;;
+  esac
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "错误：检测到疑似非 systemd 环境，无法安装 systemd；此脚本需要 systemd；此脚本需要使用 systemd管理的linux系统"
+    exit 1
+  fi
+}
+
+function ensure_docker() {
+  if command -v docker >/dev/null 2>&1; then return; fi
+  echo "错误：未检测到 docker"
+  echo "Docker 软件包较大，且安装过程涉及服务配置。请先确认本机已正确安装 Docker 并已启动服务。"
+  echo "参考官方安装指南：https://docs.docker.com/ "
+  echo "安装完成后请重新运行本脚本。"
+  exit 1
+}
+
+function ensure_requirements() {
+  detect_pkg_manager
+  ensure_ip
+  ensure_ipcalc
+  ensure_systemctl
+  ensure_docker
+}
+
+# 交互式依赖检查：仅在用户确认后才安装缺失依赖，除了docker
+function ensure_requirements_interactive() {
+  detect_pkg_manager
+  local proceed=1
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "错误：未检测到 docker。请先安装并启动 Docker 后再继续。"
+    echo "参考：https://docs.docker.com/ 或便利脚本 https://get.docker.com"
+    proceed=0
+  fi
+
+  if ! command -v ip >/dev/null 2>&1; then
+    read -p "未检测到 ip (iproute2/iproute)，是否自动安装？[Y/n] " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+      ensure_ip
+    else
+      proceed=0
+    fi
+  fi
+
+  if ! command -v ipcalc >/dev/null 2>&1; then
+    read -p "未检测到 ipcalc，是否自动安装？[Y/n] " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+      ensure_ipcalc
+    else
+      echo "你拒绝安装ipcalc，导致将使用备用方法计算网段"
+    fi
+  fi
+
+  if ! command -v systemctl >/dev/null 2>&1; then
+    read -p "未检测到 systemctl (systemd)，是否自动安装？[Y/n] " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+      ensure_systemctl
+    else
+      proceed=0
+    fi
+  fi
+
+  if [ "$proceed" -eq 0 ]; then
+    echo "依赖未满足或用户取消安装，操作中止。"
+    return 1
+  fi
+  return 0
+}
+
 # 生成本地管理的随机 MAC 地址（unicast），以 02 开头避免冲突
 function generate_mac() {
   if command -v hexdump >/dev/null 2>&1; then
@@ -95,6 +242,10 @@ function select_nic() {
 
 
 function install_macvlan_service() {
+  # 安装前进行交互式依赖检查，仅在用户确认后安装缺失依赖
+  if ! ensure_requirements_interactive; then
+    return 1
+  fi
   select_nic
   
   # 写入自动macvlan配置脚本，使用选定的网卡和DHCP模式
@@ -322,12 +473,6 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# 检查必要命令
-for cmd in docker ip ipcalc systemctl; do
-  if ! command -v $cmd &> /dev/null; then
-    echo "错误：未找到命令 $cmd，请先安装相关软件包"
-    exit 1
-  fi
-done
+# 启动脚本不进行写入或安装操作，所有改动依据菜单选择执行
 
 show_menu
