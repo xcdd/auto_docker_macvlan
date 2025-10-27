@@ -4,12 +4,13 @@
 # 该脚本在宿主机上创建并管理 Docker 的 macvlan 网络，
 # 让容器以“局域网独立主机”的方式加入与宿主机相同网段。
 #
-# 简化原则：使用 Docker IPAM 的静态/固定 IP 分配，无需容器内 DHCP 客户端。
+# 简化原则：使用 Docker IPAM 的静态/固定 IP 分配，不依赖容器内 DHCP 客户端。
 # - 创建 macvlan 网络时指定子网和网关；
 # - 运行容器时直接指定 IP（docker run --ip 或 Compose 的 ipv4_address）；
 # - 如需路由器识别或固定地址，可指定 MAC（--mac-address / mac_address）。
 #
-# 运行完成后需要做的事：为容器规划静态 IP，并配置唯一的 MAC。
+# 运行完成后，你要为容器规划指定 IP，并配置唯一的 MAC，
+# 然后在路由器上设置后续DHCP的范围不要与容器IP冲突。
 # 运行容器时务必在命令或 Compose 中设置 --ip 与 --mac-address。
 
 SERVICE_SCRIPT="/usr/local/bin/auto_macvlan.sh"
@@ -316,10 +317,17 @@ if ip link add \$VMHOST_IF link \$NETCARD type macvlan mode bridge; then
   
   ip addr add \$HOST_IF_IP/\$NETMASK dev \$VMHOST_IF
   ip link set \$VMHOST_IF up
+
+  # 关闭该虚拟接口上的 IPv6 自动配置，避免通过 RA/SLAAC 获得 IPv6
+  sysctl -w net.ipv6.conf.\$VMHOST_IF.disable_ipv6=1 2>/dev/null || true
+  sysctl -w net.ipv6.conf.\$VMHOST_IF.autoconf=0 2>/dev/null || true
+  sysctl -w net.ipv6.conf.\$VMHOST_IF.accept_ra=0 2>/dev/null || true
   
-  # 添加路由
-  ip route add \$SUBNET dev \$VMHOST_IF 2>/dev/null
-  
+  # 安全提示：不默认向整段网段添加路由，避免影响同网段其它服务
+  # 如需从宿主机访问某一容器，请为该容器 IP 添加主机路由：
+  #   ip route add <容器IP>/32 dev \$VMHOST_IF
+  # 也可通过管理脚本菜单中的“添加容器IP路由”进行交互式管理。
+
   echo "宿主机macvlan接口已配置: \$HOST_IF_IP"
   echo "macvlan网络配置完成！"
   echo ""
@@ -411,6 +419,140 @@ function show_status() {
   echo "========================================="
 }
 
+# 为容器 IP 添加/删除主机路由，避免对整个网段的影响
+function add_container_route() {
+  if ! ip link show macvlan-host &>/dev/null; then
+    echo "错误：macvlan-host 接口不存在，请先安装并启动服务。"
+    return 1
+  fi
+  read -p "请输入容器 IPv4 地址（例如 192.168.2.100）：" target_ip
+  if [[ ! "$target_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "无效的 IPv4 地址格式"
+    return 1
+  fi
+  if ip route add "$target_ip/32" dev macvlan-host 2>/dev/null; then
+    echo "已为 $target_ip 添加主机路由到 macvlan-host"
+  else
+    echo "可能该主机路由已存在或添加失败，当前路由："
+    ip route show | grep -E "(^| )$target_ip/32( |$)" || true
+  fi
+}
+
+function del_container_route() {
+  # 显示已存在的 /32 主机路由，并允许用户按序号选择删除
+  local entries
+  mapfile -t entries < <(ip route show | awk '$0 ~ /dev macvlan-host/ { addr=$1; sub(/\\/32$/, "", addr); if (addr ~ /^([0-9]{1,3}\\.){3}[0-9]{1,3}$/) print addr }')
+  if ((${#entries[@]} > 0)); then
+    echo "已发现以下指向 macvlan-host 的主机路由："
+    for i in "${!entries[@]}"; do echo "$((i+1)). ${entries[$i]}"; done
+    echo "可直接输入 IP 或输入序号选择要删除的目标。"
+  else
+    echo "未扫描到指向 macvlan-host 的 /32 主机路由。"
+  fi
+  read -p "请输入容器 IPv4 或序号（例如 192.168.2.100 或 1）：" sel
+  local target_ip=""
+  if [[ "$sel" =~ ^[0-9]+$ ]] && ((${#entries[@]} >= sel)) && ((sel >= 1)); then
+    target_ip="${entries[$((sel-1))]}"
+  else
+    target_ip="$sel"
+  fi
+  if [[ ! "$target_ip" =~ ^([0-9]{1,3}\\.){3}[0-9]{1,3}$ ]]; then
+    echo "无效的 IPv4 地址格式"
+    return 1
+  fi
+  if ip route delete "$target_ip/32" dev macvlan-host 2>/dev/null; then
+    echo "已删除 $target_ip 的主机路由"
+  else
+    echo "未找到 $target_ip 的主机路由或删除失败"
+  fi
+}
+
+# 一次性创建宿主 macvlan 接口（不安装服务，不创建整网路由）
+function create_macvlan_host_once() {
+  # 仅确保必要命令：ip；ipcalc可选
+  if ! command -v ip >/dev/null 2>&1; then
+    read -p "未检测到 ip 命令，是否自动安装？[Y/n] " ans
+    if [[ ! "$ans" =~ ^[Nn]$ ]]; then
+      ensure_ip
+    else
+      echo "取消：缺少 ip 命令"
+      return 1
+    fi
+  fi
+
+  select_nic
+  local NETCARD="$SELECTED_NIC"
+  local VMHOST_IF="macvlan-host"
+
+  if ip link show "$VMHOST_IF" >/dev/null 2>&1; then
+    echo "错误：接口 $VMHOST_IF 已存在。如需重新创建，请先删除。"
+    return 1
+  fi
+
+  # 获取 IPv4 信息
+  IP_INFO=$(ip -4 addr show "$NETCARD" 2>/dev/null | grep 'inet ' | awk '{print $2}' | head -1)
+  if [ -z "$IP_INFO" ]; then
+    echo "错误：网卡 $NETCARD 未分配 IPv4 地址"
+    return 1
+  fi
+  IP_ADDR=$(echo "$IP_INFO" | cut -d'/' -f1)
+  NETMASK=$(echo "$IP_INFO" | cut -d'/' -f2)
+
+  # 分配宿主侧接口的 IPv4（主机最后一段 +50，越界则 -50）
+  LAST_OCTET=$(echo "$IP_ADDR" | awk -F. '{print $4}')
+  NEW_OCTET=$((LAST_OCTET + 50))
+  if [ "$NEW_OCTET" -gt 254 ]; then
+    NEW_OCTET=$((LAST_OCTET - 50))
+    if [ "$NEW_OCTET" -lt 1 ]; then NEW_OCTET=1; fi
+  fi
+  HOST_IF_IP=$(echo "$IP_ADDR" | awk -F. '{print $1"."$2"."$3"."}')"$NEW_OCTET"
+
+  echo "正在创建宿主机 macvlan 接口 $VMHOST_IF 于 $NETCARD..."
+  if ! ip link add "$VMHOST_IF" link "$NETCARD" type macvlan mode bridge; then
+    echo "错误：创建接口失败"
+    return 1
+  fi
+  ip addr add "$HOST_IF_IP/$NETMASK" dev "$VMHOST_IF"
+  ip link set "$VMHOST_IF" up
+  sysctl -w net.ipv6.conf.$VMHOST_IF.disable_ipv6=1 2>/dev/null || true
+  sysctl -w net.ipv6.conf.$VMHOST_IF.autoconf=0 2>/dev/null || true
+  sysctl -w net.ipv6.conf.$VMHOST_IF.accept_ra=0 2>/dev/null || true
+
+  echo "已创建：$VMHOST_IF -> $HOST_IF_IP/$NETMASK"
+  echo "注意：未创建 Docker 网络，也未添加整网段路由。"
+  echo "如需从宿主访问某容器，请添加主机路由：ip route add <容器IP>/32 dev $VMHOST_IF"
+}
+
+# 删除一次性创建的宿主 macvlan 接口（不影响服务文件与 Docker 网络）
+function delete_macvlan_host_only() {
+  local VMHOST_IF="macvlan-host"
+  if ip link show "$VMHOST_IF" >/dev/null 2>&1; then
+    if ip link delete "$VMHOST_IF" 2>/dev/null; then
+      echo "已删除宿主接口 $VMHOST_IF"
+    else
+      echo "删除 $VMHOST_IF 失败"
+    fi
+  else
+    echo "$VMHOST_IF 接口不存在"
+  fi
+}
+
+# 卸载除宿主 macvlan 接口外的其它配置（保留 macvlan-host）
+function uninstall_keep_macvlan_host() {
+  echo "正在移除除宿主 macvlan 接口外的配置..."
+  # 停止并禁用服务
+  systemctl stop $SERVICE_NAME 2>/dev/null
+  systemctl disable $SERVICE_NAME 2>/dev/null
+  # 删除 Docker 网络（不影响宿主 macvlan 接口）
+  docker network rm mymacvlan 2>/dev/null
+  # 删除服务文件
+  rm -f $SERVICE_UNIT
+  rm -f $SERVICE_SCRIPT
+  systemctl daemon-reload
+  echo "已移除：服务与 Docker 网络；保留：macvlan-host 接口"
+  echo "如需彻底删除宿主接口，可使用菜单中的删除接口功能。"
+}
+
 # 文字版使用说明
 function show_usage() {
   echo ""
@@ -442,21 +584,29 @@ function show_menu() {
   echo "========================================="
   echo "        Docker Macvlan 管理脚本"
   echo "========================================="
-  echo "1) 安装 macvlan 自动服务"
-  echo "2) 卸载 macvlan 自动服务"  
-  echo "3) 查看服务状态"
-  echo "4) 生成随机 MAC 地址"
-  echo "5) 查看使用说明"
+  echo "1) 安装 macvlan 网卡且自动跟随外网更新配置"
+  echo "2) 卸载 macvlan 网卡与自动跟随外网更新配置"
+  echo "3) 只安装 macvlan 网卡（不安装自动跟随外网更新配置）"
+  echo "4) 删除除了新建 macvlan 网卡以外本脚本的改动"
+  echo "5) 查看服务状态"
+  echo "6) 生成随机 MAC 地址的小工具"
+  echo "7) 添加容器 IP 路由（当你需要从宿主访问某个容器）"
+  echo "8) 删除容器 IP 路由（当外部网络环境发生改变，且通过功能[7]添加过路由）"
+  echo "9) 查看使用说明"
   echo "q) 退出"
   echo "========================================="
-  read -p "请输入选择（1-5, q）：" choice
+  read -p "请输入选择（1-9, q）：" choice
   
   case $choice in
     1) install_macvlan_service ;;
     2) uninstall_macvlan_service ;;
-    3) show_status ;;
-    4) print_random_mac ;;
-    5) show_usage ;;
+    3) create_macvlan_host_once ;;
+    4) uninstall_keep_macvlan_host ;;
+    5) show_status ;;
+    6) print_random_mac ;;
+    7) add_container_route ;;
+    8) del_container_route ;;
+    9) show_usage ;;
     q|Q) echo "退出脚本"; exit 0 ;;
     *) echo "无效选择，请重新输入"; show_menu ;;
   esac
