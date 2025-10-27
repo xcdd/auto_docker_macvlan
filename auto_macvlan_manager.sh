@@ -17,6 +17,13 @@ SERVICE_SCRIPT="/usr/local/bin/auto_macvlan.sh"
 SERVICE_UNIT="/etc/systemd/system/auto_macvlan.service"
 SERVICE_NAME="auto_macvlan"
 
+# 持久化路由：清单文件与应用脚本/服务定义
+ROUTES_DIR="/etc/auto_macvlan"
+ROUTES_FILE="$ROUTES_DIR/routes.txt"
+ROUTES_SCRIPT="/usr/local/bin/auto_macvlan_routes.sh"
+ROUTES_UNIT="/etc/systemd/system/auto_macvlan-routes.service"
+ROUTES_SERVICE_NAME="auto_macvlan-routes"
+
 # 自动安装依赖：根据系统包管理器安装缺失的命令
 function detect_pkg_manager() {
   if command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"; return; fi
@@ -383,6 +390,8 @@ function uninstall_macvlan_service() {
   
   systemctl stop $SERVICE_NAME 2>/dev/null
   systemctl disable $SERVICE_NAME 2>/dev/null
+  systemctl stop $ROUTES_SERVICE_NAME 2>/dev/null
+  systemctl disable $ROUTES_SERVICE_NAME 2>/dev/null
   
   # 清理网络配置
   docker network rm mymacvlan 2>/dev/null
@@ -391,6 +400,9 @@ function uninstall_macvlan_service() {
   # 删除文件
   rm -f $SERVICE_UNIT
   rm -f $SERVICE_SCRIPT
+  rm -f $ROUTES_UNIT
+  rm -f $ROUTES_SCRIPT
+  rm -f $ROUTES_FILE
   
   systemctl daemon-reload
   
@@ -408,11 +420,25 @@ function show_status() {
     echo "服务状态："
     systemctl status $SERVICE_NAME --no-pager -l
     echo ""
+    echo "路由服务状态："
+    if [ -f "$ROUTES_UNIT" ]; then
+      systemctl status $ROUTES_SERVICE_NAME --no-pager -l
+    else
+      echo "未安装 $ROUTES_SERVICE_NAME"
+    fi
+    echo ""
     echo "Docker网络："
     docker network ls | grep -E "NAME|macvlan"
     echo ""
     echo "macvlan虚拟接口："
     ip addr show macvlan-host 2>/dev/null || echo "macvlan-host接口不存在"
+    echo ""
+    echo "持久化路由清单 ($ROUTES_FILE)："
+    if [ -f "$ROUTES_FILE" ]; then
+      nl -ba "$ROUTES_FILE" | sed -n '1,100p'
+    else
+      echo "未找到路由清单文件"
+    fi
   else
     echo "macvlan服务未安装"
   fi
@@ -432,6 +458,16 @@ function add_container_route() {
   fi
   if ip route add "$target_ip/32" dev macvlan-host 2>/dev/null; then
     echo "已为 $target_ip 添加主机路由到 macvlan-host"
+    # 写入持久化清单（去重）
+    mkdir -p "$ROUTES_DIR"
+    if ! grep -qx "$target_ip" "$ROUTES_FILE" 2>/dev/null; then
+      echo "$target_ip" >> "$ROUTES_FILE"
+      echo "已记录到持久化清单：$ROUTES_FILE"
+    else
+      echo "持久化清单中已存在该 IP：$target_ip"
+    fi
+    # 确保已生成路由脚本与服务，并立即应用清单
+    apply_routes_now
   else
     echo "可能该主机路由已存在或添加失败，当前路由："
     ip route show | grep -E "(^| )$target_ip/32( |$)" || true
@@ -462,9 +498,223 @@ function del_container_route() {
   fi
   if ip route delete "$target_ip/32" dev macvlan-host 2>/dev/null; then
     echo "已删除 $target_ip 的主机路由"
+    # 从持久化清单移除该 IP
+    if [ -f "$ROUTES_FILE" ]; then
+      grep -vx "$target_ip" "$ROUTES_FILE" > "$ROUTES_FILE.tmp" && mv "$ROUTES_FILE.tmp" "$ROUTES_FILE"
+      echo "已从持久化清单移除：$target_ip"
+    fi
+    # 变更后应用或自动清理（当清单为空时）
+    apply_routes_now
   else
     echo "未找到 $target_ip 的主机路由或删除失败"
   fi
+}
+
+# 选择可用编辑器并打开文件，编辑完成后返回
+function open_in_editor() {
+  local file="$1"
+  local editor="${EDITOR:-}"
+  if [ -n "$editor" ] && command -v "$editor" >/dev/null 2>&1; then
+    "$editor" "$file"
+    return $?
+  fi
+  for e in nano vim vi; do
+    if command -v "$e" >/dev/null 2>&1; then
+      "$e" "$file"
+      return $?
+    fi
+  done
+  echo "未找到可用编辑器。请手动编辑：$file"
+  echo "你可以使用：echo '192.168.x.y' >> $file"
+  read -p "按回车继续..." _
+}
+
+# 检查路由清单是否包含至少一条有效 IPv4
+function has_valid_routes() {
+  shopt -s extglob
+  local file="$ROUTES_FILE"
+  [ -f "$file" ] || return 1
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line##*( )}"
+    line="${line%%*( )}"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+# 统计清单中的有效 IPv4 条数
+function count_valid_routes() {
+  shopt -s extglob
+  local file="$ROUTES_FILE"
+  local count=0
+  if [ -f "$file" ]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line##*( )}"
+      line="${line%%*( )}"
+      [ -z "$line" ] && continue
+      if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        count=$((count+1))
+      fi
+    done < "$file"
+  fi
+  echo "$count"
+}
+
+# 根据清单生成路由脚本与服务（仅在存在有效路由时）
+function ensure_routes_artifacts() {
+  mkdir -p "$ROUTES_DIR"
+  if ! has_valid_routes; then
+    return 0
+  fi
+  # 写路由脚本
+  if [ ! -f "$ROUTES_SCRIPT" ]; then
+    cat > "$ROUTES_SCRIPT" << 'EOF'
+#!/bin/bash
+set -euo pipefail
+shopt -s extglob
+
+ROUTES_FILE="/etc/auto_macvlan/routes.txt"
+VMHOST_IF="macvlan-host"
+
+# 等待接口可用（最多 5 秒）
+for i in $(seq 1 5); do
+  if ip link show "$VMHOST_IF" >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+
+if ! ip link show "$VMHOST_IF" >/dev/null 2>&1; then
+  echo "错误：接口 $VMHOST_IF 不存在，无法应用持久化路由" >&2
+  exit 1
+fi
+
+apply_route() {
+  local ip="$1"
+  ip route replace "$ip/32" dev "$VMHOST_IF" 2>/dev/null && echo "已应用持久化路由：$ip -> $VMHOST_IF" || echo "应用持久化路由失败：$ip"
+}
+
+# 读取路由清单并应用
+if [ -f "$ROUTES_FILE" ]; then
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    line="${line##*( )}"
+    line="${line%%*( )}"
+    [ -z "$line" ] && continue
+    if [[ "$line" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      apply_route "$line"
+    else
+      echo "跳过无效项：$line" >&2
+    fi
+  done < "$ROUTES_FILE"
+else
+  echo "未找到路由清单：$ROUTES_FILE"
+fi
+EOF
+    chmod +x "$ROUTES_SCRIPT"
+  fi
+
+  # 写路由服务单元
+  if [ ! -f "$ROUTES_UNIT" ]; then
+    cat > "$ROUTES_UNIT" << EOF
+[Unit]
+Description=Apply persisted /32 routes for macvlan-host
+After=$SERVICE_NAME.service
+Wants=$SERVICE_NAME.service
+
+[Service]
+Type=oneshot
+ExecStart=$ROUTES_SCRIPT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || true
+    systemctl enable "$ROUTES_SERVICE_NAME" || true
+  fi
+}
+
+# 当清单为空时，停用并删除路由服务与脚本（外部实现，避免生成脚本中的未定义变量）
+function cleanup_routes_artifacts() {
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop $ROUTES_SERVICE_NAME 2>/dev/null || true
+    systemctl disable $ROUTES_SERVICE_NAME 2>/dev/null || true
+  fi
+  rm -f "$ROUTES_UNIT"
+  rm -f "$ROUTES_SCRIPT"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+  fi
+  echo "路由清单为空，已停用并删除路由服务与脚本。"
+}
+
+# 立即应用路由清单：如果 systemd 可用则重启服务，否则直接执行脚本
+function apply_routes_now() {
+  if ! has_valid_routes; then
+    cleanup_routes_artifacts
+    return 0
+  fi
+  ensure_routes_artifacts
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart $ROUTES_SERVICE_NAME || true
+  fi
+  if [ -x "$ROUTES_SCRIPT" ]; then
+    "$ROUTES_SCRIPT" || true
+  else
+    echo "未找到路由脚本：$ROUTES_SCRIPT"
+  fi
+}
+
+# 编辑前预览当前清单与将执行的动作摘要
+function preview_routes_actions_before_edit() {
+  local count
+  count=$(count_valid_routes)
+  if [ -f "$ROUTES_FILE" ]; then
+    echo "当前路由清单：$ROUTES_FILE"
+    echo "有效 IPv4 条数：$count"
+  else
+    echo "当前路由清单：尚未创建 ($ROUTES_FILE)"
+    echo "有效 IPv4 条数：0"
+  fi
+  echo "动作摘要："
+  if (( count > 0 )); then
+    if [ -f "$ROUTES_UNIT" ] && [ -x "$ROUTES_SCRIPT" ]; then
+      echo "- 将重启 $ROUTES_SERVICE_NAME 并应用 $count 条路由"
+    else
+      echo "- 将创建路由脚本与服务，并应用 $count 条路由"
+    fi
+  else
+    if [ -f "$ROUTES_UNIT" ] || [ -f "$ROUTES_SCRIPT" ]; then
+      echo "- 清单为空，将停用并删除路由服务与脚本"
+    else
+      echo "- 清单为空，当前无需额外操作"
+    fi
+  fi
+}
+
+# 编辑并应用持久化路由清单
+function edit_routes_and_apply() {
+  mkdir -p "$ROUTES_DIR"
+  preview_routes_actions_before_edit
+  echo "正在打开路由清单：$ROUTES_FILE"
+  open_in_editor "$ROUTES_FILE"
+  echo "已返回，正在应用路由清单..."
+  apply_routes_now
+  echo "已应用路由清单。可再次查看状态以确认。"
+}
+
+# 仅应用当前路由清单（不编辑）
+function apply_routes_file_now() {
+  if [ ! -f "$ROUTES_FILE" ]; then
+    echo "路由清单不存在：$ROUTES_FILE"
+    return 1
+  fi
+  echo "正在应用路由清单：$ROUTES_FILE"
+  apply_routes_now
+  echo "已应用路由清单。"
 }
 
 # 一次性创建宿主 macvlan 接口（不安装服务，不创建整网路由）
@@ -543,14 +793,21 @@ function uninstall_keep_macvlan_host() {
   # 停止并禁用服务
   systemctl stop $SERVICE_NAME 2>/dev/null
   systemctl disable $SERVICE_NAME 2>/dev/null
+  systemctl stop $ROUTES_SERVICE_NAME 2>/dev/null
+  systemctl disable $ROUTES_SERVICE_NAME 2>/dev/null
   # 删除 Docker 网络（不影响宿主 macvlan 接口）
   docker network rm mymacvlan 2>/dev/null
   # 删除服务文件
   rm -f $SERVICE_UNIT
   rm -f $SERVICE_SCRIPT
+  rm -f $ROUTES_UNIT
+  rm -f $ROUTES_SCRIPT
+  rm -f $ROUTES_FILE
   systemctl daemon-reload
   echo "已移除：服务与 Docker 网络；保留：macvlan-host 接口"
   echo "如需彻底删除宿主接口，可使用菜单中的删除接口功能。"
+  echo "提示：已删除持久化路由服务。如需恢复，请重新安装服务并重新记录路由。"
+  echo "已删除持久化路由清单：$ROUTES_FILE"
 }
 
 # 文字版使用说明
@@ -582,16 +839,16 @@ function show_usage() {
 function show_menu() {
   echo ""
   echo "========================================="
-  echo "        Docker Macvlan 管理脚本"
+  echo "      Linux Docker Macvlan 管理脚本"
   echo "========================================="
   echo "1) 安装 macvlan 网卡且自动跟随外网更新配置"
   echo "2) 卸载 macvlan 网卡与自动跟随外网更新配置"
   echo "3) 只安装 macvlan 网卡（不安装自动跟随外网更新配置）"
   echo "4) 删除除了新建 macvlan 网卡以外本脚本的改动"
   echo "5) 查看服务状态"
-  echo "6) 生成随机 MAC 地址的小工具"
-  echo "7) 添加容器 IP 路由（当你需要从宿主访问某个容器）"
-  echo "8) 删除容器 IP 路由（当外部网络环境发生改变，且通过功能[7]添加过路由）"
+  echo "6) 生成随机 MAC 地址的工具"
+  echo "7) 编辑并应用路由清单 (当你需要从宿主访问某个容器)"
+  echo "8) 立刻应用路由清单 (如果你从其他地方修改过路由，需要刷新服务)"
   echo "9) 查看使用说明"
   echo "q) 退出"
   echo "========================================="
@@ -604,8 +861,8 @@ function show_menu() {
     4) uninstall_keep_macvlan_host ;;
     5) show_status ;;
     6) print_random_mac ;;
-    7) add_container_route ;;
-    8) del_container_route ;;
+    7) edit_routes_and_apply ;;
+    8) apply_routes_file_now ;;
     9) show_usage ;;
     q|Q) echo "退出脚本"; exit 0 ;;
     *) echo "无效选择，请重新输入"; show_menu ;;
